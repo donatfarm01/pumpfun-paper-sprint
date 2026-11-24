@@ -69,12 +69,16 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
   for (const mint of state.positions.keys()) {
     if (!openedSlot.has(mint)) openedSlot.set(mint, state.slot);
   }
-  for (const mint of [...openedSlot.keys()]) {
-    if (!state.positions.has(mint)) {
-      openedSlot.delete(mint);
-      peakMult.delete(mint);
-      tookProfit.delete(mint);
-    }
+  // Collect first, delete after: removing entries while iterating the map
+  // would skip entries.
+  const stale: string[] = [];
+  for (const mint of openedSlot.keys()) {
+    if (!state.positions.has(mint)) stale.push(mint);
+  }
+  for (const mint of stale) {
+    openedSlot.delete(mint);
+    peakMult.delete(mint);
+    tookProfit.delete(mint);
   }
 
   const orders: OrderInput[] = [];
@@ -82,18 +86,25 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
   let freeCash = state.freeCashLamports();
   let committed = state.committedPositionCount();
   const maxPositions = state.hello.caps.max_open_positions;
-  const active = [...new Set(batch.events.map((e) => e.mint))].sort();
-  const held = [...state.positions.keys()].sort();
+  // Distinct mints that traded this batch, sorted. Most batches carry one or
+  // two events, so a small dedup loop beats building a Set and mapping first.
+  const active: string[] = [];
+  for (const e of batch.events) {
+    if (!active.includes(e.mint)) active.push(e.mint);
+  }
+  if (active.length > 1) active.sort();
+  // Held mints need no sorting here: only membership in the exit set matters,
+  // and the exits themselves are sorted before any order is placed.
+  const held = state.positions.keys();
   const pendingBuyMints = new Set<string>();
   for (const p of state.pending.values()) {
     if (p.order.side === 'buy') pendingBuyMints.add(p.order.mint);
   }
 
   // ---- exits: held coins that traded this batch, plus any held coin whose timeout is up ----
-  const activeSet = new Set(active);
   const exitMints = new Set<string>();
   for (const mint of held) {
-    if (activeSet.has(mint)) exitMints.add(mint);
+    if (active.includes(mint)) exitMints.add(mint);
     const opened = openedSlot.get(mint);
     if (opened !== undefined && state.slot - opened >= TIMEOUT_SLOTS) exitMints.add(mint);
   }

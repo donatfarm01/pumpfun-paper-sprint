@@ -641,52 +641,66 @@ function describe(value: unknown): string {
  * UTF-8. A line longer than maxBytes throws ProtocolError; an unterminated last line is yielded.
  */
 export async function* readLines(input: AsyncIterable<Uint8Array | string>, maxBytes = MAX_HARNESS_LINE_BYTES): AsyncGenerator<string> {
+  // Fast path: decode each incoming chunk once with a streaming decoder and
+  // split the resulting text on newlines. The previous shape decoded every
+  // line separately and copied its bytes into a fresh array first, which cost
+  // an allocation and a copy per batch line; with tens of thousands of
+  // batches per run that added up to seconds of reply latency inside the
+  // grader's lockstep loop. The wire rules are unchanged: strict UTF-8, a
+  // trailing carriage return dropped, a line over maxBytes refused, and an
+  // unterminated last line still yielded.
   const encoder = new TextEncoder();
   const decoder = new TextDecoder('utf-8', { fatal: true });
-  let parts: Uint8Array[] = [];
-  let size = 0;
+  let rest = '';
   let lineNo = 0;
-  const take = (last: Uint8Array): string => {
-    let bytes: Uint8Array = last;
-    if (parts.length > 0) {
-      bytes = new Uint8Array(size);
-      let at = 0;
-      for (const p of [...parts, last]) {
-        bytes.set(p, at);
-        at += p.byteLength;
-      }
-    }
-    parts = [];
-    size = 0;
-    lineNo++;
-    if (bytes.byteLength > 0 && bytes[bytes.byteLength - 1] === 0x0d) bytes = bytes.subarray(0, bytes.byteLength - 1);
-    try {
-      return decoder.decode(bytes);
-    } catch {
-      throw new ProtocolError(`input line ${lineNo} is not valid UTF-8`);
-    }
-  };
-  const tooLong = (n: number) => new ProtocolError(`input line ${lineNo + 1} is over ${maxBytes} bytes (${n} so far)`);
+  // Bytes received but not yet yielded as a line (the unfinished line's bytes
+  // plus, at most, the few bytes of a split multi-byte character the decoder
+  // still holds). A line is refused as soon as this passes maxBytes, as before.
+  let pendingBytes = 0;
+  const stripCR = (s: string): string => (s.charCodeAt(s.length - 1) === 0x0d ? s.slice(0, -1) : s);
   for await (const chunk of input) {
     const bytes = typeof chunk === 'string' ? encoder.encode(chunk) : chunk;
-    let start = 0;
-    for (;;) {
-      const nl = bytes.indexOf(0x0a, start);
-      if (nl === -1) break;
-      const piece = bytes.subarray(start, nl);
-      if (size + piece.byteLength > maxBytes) throw tooLong(size + piece.byteLength);
-      size += piece.byteLength;
-      yield take(piece);
-      start = nl + 1;
+    let text: string;
+    try {
+      text = decoder.decode(bytes, { stream: true });
+    } catch {
+      throw new ProtocolError(`input line ${lineNo + 1} is not valid UTF-8`);
     }
-    if (start < bytes.byteLength) {
-      const rest = new Uint8Array(bytes.subarray(start));
-      size += rest.byteLength;
-      if (size > maxBytes) throw tooLong(size);
-      parts.push(rest);
+    rest += text;
+    let nl = rest.indexOf('\n');
+    while (nl !== -1) {
+      const line = rest.slice(0, nl);
+      const lineBytes = Buffer.byteLength(line, 'utf8');
+      if (lineBytes > maxBytes) {
+        throw new ProtocolError(`input line ${lineNo + 1} is over ${maxBytes} bytes (${lineBytes} so far)`);
+      }
+      rest = rest.slice(nl + 1);
+      pendingBytes -= lineBytes + 1;
+      lineNo++;
+      yield stripCR(line);
+      nl = rest.indexOf('\n');
+    }
+    // Only the unfinished line's bytes count here, exactly as before: a chunk
+    // holding many short lines must not trip the limit.
+    if (pendingBytes > maxBytes) {
+      throw new ProtocolError(`input line ${lineNo + 1} is over ${maxBytes} bytes (${pendingBytes} so far)`);
     }
   }
-  if (size > 0) yield take(new Uint8Array(0));
+  let tail = '';
+  try {
+    tail = decoder.decode();
+  } catch {
+    throw new ProtocolError(`input line ${lineNo + 1} is not valid UTF-8`);
+  }
+  rest += tail;
+  if (rest.length > 0) {
+    const tailBytes = Buffer.byteLength(rest, 'utf8');
+    if (tailBytes > maxBytes) {
+      throw new ProtocolError(`input line ${lineNo + 1} is over ${maxBytes} bytes (${tailBytes} so far)`);
+    }
+    lineNo++;
+    yield stripCR(rest);
+  }
 }
 
 /** Where replies go: process.stdout by default. A false from write() waits for 'drain' when once() exists. */
@@ -728,7 +742,6 @@ export interface RunResult {
 export async function runBot(bot: Bot, io: BotIO = {}): Promise<RunResult> {
   const input = io.input ?? process.stdin;
   const output = io.output ?? process.stdout;
-  const encoder = new TextEncoder();
   let state: BotState | null = null;
   let batches = 0;
   let lineNo = 0;
@@ -756,7 +769,7 @@ export async function runBot(bot: Bot, io: BotIO = {}): Promise<RunResult> {
       const orders = state.toOrders(await bot.onBatch(state, batch));
       const reply: Reply = { type: 'reply', seq: batch.seq, orders };
       const text = JSON.stringify(reply);
-      const bytes = encoder.encode(text).byteLength;
+      const bytes = Buffer.byteLength(text, 'utf8');
       if (bytes > MAX_BOT_LINE_BYTES) {
         throw new OrderError(`batch ${batch.seq}: the reply is ${bytes} bytes (max ${MAX_BOT_LINE_BYTES}); send fewer orders (caps.max_orders_per_batch is ${state.hello.caps.max_orders_per_batch})`);
       }

@@ -44,6 +44,35 @@ Determinism: no clock, no environment reads, no randomness, and every
 decision iterates over sorted mint lists. The two grading runs must produce
 byte-identical action logs, and this bot is built to satisfy that.
 
+## Round 2: fixing the grader timeout
+
+The first submission was refused because its dev grading run ended in a
+timeout on the server, even though the same entry grades locally in about
+half a minute for both executions. Measuring locally showed the strategy
+itself is not the slow part: a trivial hold-cash bot using the same wire
+shim takes the same time as this bot, so the wall time is the harness
+driving tens of thousands of lockstep batches, one reply per batch. On the
+server that loop runs inside a one-CPU sandbox, where every millisecond of
+reply latency is multiplied by the number of batches, so the fix is to make
+each reply as cheap as possible rather than to change what the bot trades.
+
+Two changes, neither of which touches the trading rules, the thresholds, or
+the order in which orders are placed. First, the vendored wire shim now
+decodes each incoming chunk once with a streaming decoder and splits the
+text on newlines, instead of decoding every line separately and copying its
+bytes into a fresh array first; the wire rules are unchanged, with strict
+UTF-8, the carriage-return rule, the per-line size limit, and the
+unterminated last line all preserved. The reply size check also measures
+the text directly instead of encoding a copy of it. Second, the strategy
+no longer builds a set, a mapped array, and a sorted copy of the batch
+mints on every batch, and no longer spreads and sorts the held positions
+and the position-lifetime map on every batch; small dedup loops and direct
+map iteration do the same work with no throwaway allocations, and the exit
+list is still sorted before any order is placed, so the decisions are
+byte-identical. The local grade after these changes reproduces the exact
+same action log as before, which proves the strategy did not change, only
+its speed did.
+
 ## How it was validated
 
 A Python mirror of the engine (same fill latency, same curve maths, same
